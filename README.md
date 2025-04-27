@@ -293,3 +293,9 @@ tg-signer monitor run my_monitor
 
 3 directories, 4 files
 ```
+
+### 配置与运行定时任务
+
+你可以使用 `scheduler` 命令来配置和运行定时任务，例如定时发送消息到多个频道。
+
+#### 定时发送消息到多个频道

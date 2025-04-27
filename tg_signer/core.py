@@ -39,7 +39,7 @@ from tg_signer.config import (
 from .ai_tools import (
     calculate_problem,
     choose_option_by_image,
-    get_openai_client,
+    get_tongyi_client,
     get_reply,
 )
 from .notification.server_chan import sc_send
@@ -493,7 +493,7 @@ class UserSignerWorkerContext(TypedDict, total=False):
     sign_chats: dict[int, list[SignChat]]
 
 
-OPENAI_USE_PROMPT = '在运行前请通过环境变量正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`。默认模型为"gpt-4o", 可通过环境变量`OPENAI_MODEL`更改。'
+OPENAI_USE_PROMPT = '在运行前请通过环境变量正确设置`TONGYI_API_KEY`。默认模型为"qwen-plus", 可通过环境变量`TONGYI_MODEL`更改。'
 
 
 class UserSigner(BaseUserWorker):
@@ -782,10 +782,10 @@ class UserSigner(BaseUserWorker):
                             return True
                 if message.photo is not None and chat.choose_option_by_image:
                     self.log("检测到图片，尝试调用大模型进行图片")
-                    ai_client = get_openai_client()
+                    ai_client = await get_tongyi_client()
                     if not ai_client:
                         self.log(
-                            "未配置OpenAI API Key，无法使用AI服务", level="WARNING"
+                            "未配置通义千问 API Key，无法使用AI服务", level="WARNING"
                         )
                         return False
                     image_buffer: BinaryIO = await client.download_media(
@@ -816,9 +816,9 @@ class UserSigner(BaseUserWorker):
 
         if chat.has_calculation_problem and message.text:
             self.log("检测到文本回复，尝试调用大模型进行计算题回答")
-            ai_client = get_openai_client()
+            ai_client = await get_tongyi_client()
             if not ai_client:
-                self.log("未配置OpenAI API Key，无法使用AI服务", level="WARNING")
+                self.log("未配置通义千问 API Key，无法使用AI服务", level="WARNING")
                 return False
             self.log(f"问题: \n{message.text}")
             answer = await calculate_problem(message.text, client=ai_client)
@@ -879,165 +879,53 @@ class UserSigner(BaseUserWorker):
             for message in messages:
                 print_to_user(f"{message.date}: {message.text}")
 
-
-class UserMonitor(BaseUserWorker):
-    _workdir = ".monitor"
-    _tasks_dir = "monitors"
+class UserScheduler(BaseUserWorker):
+    _workdir = ".scheduler"
+    _tasks_dir = "schedulers"
     cfg_cls = MonitorConfig
-    config: MonitorConfig
 
-    def ask_one(self):
-        input_ = UserInput()
-        chat_id = (input_("Chat ID（登录时最近对话输出中的ID）: ")).strip()
-        if not chat_id.startswith("@"):
-            chat_id = int(chat_id)
-        rules = ["exact", "contains", "regex", "all"]
-        while rule := input_(f"匹配规则({', '.join(rules)}): ") or "exact":
-            if rule in rules:
-                break
-            print_to_user("不存在的规则, 请重新输入!")
-        rule_value = None
-        if rule != "all":
-            while not (rule_value := input_("规则值（不可为空）: ")):
-                print_to_user("不可为空！")
-                continue
-        from_user_ids = (
-            input_(
-                "只匹配来自特定用户ID的消息（多个用逗号隔开, 匹配所有用户直接回车）: "
-            )
-            or None
-        )
-        if from_user_ids:
-            from_user_ids = [
-                i if i.startswith("@") else int(i) for i in from_user_ids.split(",")
-            ]
-        default_send_text = input_("默认发送文本: ") or None
-        ai_reply = False
-        ai_prompt = None
-        use_ai_reply = input_("是否使用AI进行回复(y/N): ") or "n"
-        if use_ai_reply.lower() == "y":
-            ai_reply = True
-            while not (ai_prompt := input_("输入你的提示词（作为`system prompt`）: ")):
-                print_to_user("不可为空！")
-                continue
-            print_to_user(OPENAI_USE_PROMPT)
-
-        send_text_search_regex = None
-        if not ai_reply:
-            send_text_search_regex = (
-                input_("从消息中提取发送文本的正则表达式（不需要则直接回车）: ") or None
-            )
-
-        delete_after = (
-            input_(
-                "等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: "
-            )
-            or None
-        )
-        if delete_after:
-            delete_after = int(delete_after)
-        forward_to_chat_id = (input_("转发消息到该聊天ID，默认为消息来源：")).strip()
-        if forward_to_chat_id and not forward_to_chat_id.startswith("@"):
-            forward_to_chat_id = int(forward_to_chat_id)
-        push_via_server_chan = (
-            input_("是否通过Server酱推送消息(y/N): ") or "n"
-        ).lower() == "y"
-        server_chan_send_key = (
-            input_("Server酱的SendKey（不填将从环境变量`SERVER_CHAN_SEND_KEY`读取: ")
-            or None
-        )
-        return MatchConfig.model_validate(
-            {
-                "chat_id": chat_id,
-                "rule": rule,
-                "rule_value": rule_value,
-                "from_user_ids": from_user_ids,
-                "default_send_text": default_send_text,
-                "ai_reply": ai_reply,
-                "ai_prompt": ai_prompt,
-                "send_text_search_regex": send_text_search_regex,
-                "delete_after": delete_after,
-                "forward_to_chat_id": forward_to_chat_id,
-                "push_via_server_chan": push_via_server_chan,
-                "server_chan_send_key": server_chan_send_key,
-            }
-        )
-
-    def ask_for_config(self) -> "MonitorConfig":
-        i = 1
-        print_to_user(f"开始配置任务<{self.task_name}>")
-        print_to_user(
-            "聊天chat id和用户user id均同时支持整数id和字符串username, username必须以@开头，如@neo"
-        )
-        match_cfgs = []
-        while True:
-            print_to_user(f"\n配置第{i}个监控项")
-            try:
-                match_cfgs.append(self.ask_one())
-            except Exception as e:
-                print_to_user(e)
-                print_to_user("配置失败")
-                i -= 1
-            continue_ = input("继续配置？(y/N)：")
-            if continue_.strip().lower() != "y":
-                break
-            i += 1
-        return MonitorConfig(match_cfgs=match_cfgs)
-
-    async def on_message(self, client, message: Message):
-        for match_cfg in self.config.match_cfgs:
-            if not match_cfg.match(message):
-                continue
-            self.log(f"匹配到监控项：{match_cfg}")
-            try:
-                send_text = await self.get_send_text(match_cfg, message)
-                if not send_text:
-                    self.log("发送内容为空", level="WARNING")
-                else:
-                    forward_to_chat_id = match_cfg.forward_to_chat_id or message.chat.id
-                    self.log(f"发送文本：{send_text}至{forward_to_chat_id}")
-                    await self.send_message(
-                        forward_to_chat_id,
-                        send_text,
-                        delete_after=match_cfg.delete_after,
-                    )
-
-                if match_cfg.push_via_server_chan:
-                    server_chan_send_key = (
-                        match_cfg.server_chan_send_key
-                        or os.environ.get("SERVER_CHAN_SEND_KEY")
-                    )
-                    if not server_chan_send_key:
-                        self.log("未配置Server酱的SendKey", level="WARNING")
-                    else:
-                        await sc_send(
-                            server_chan_send_key,
-                            f"匹配到监控项：{match_cfg.chat_id}",
-                            f"消息内容为:\n\n{message.text}",
-                        )
-            except IndexError as e:
-                logger.exception(e)
-
-    async def get_send_text(self, match_cfg: MatchConfig, message: Message) -> str:
-        send_text = match_cfg.get_send_text(message.text)
-        if match_cfg.ai_reply and match_cfg.ai_prompt:
-            ai_client = get_openai_client()
-            if not ai_client:
-                self.log("未配置OpenAI API Key，无法使用AI服务", level="WARNING")
-                return send_text
-            send_text = await get_reply(
-                match_cfg.ai_prompt, message.text, client=ai_client
-            )
-        return send_text
-
-    async def run(self, num_of_dialogs=20):
-        if self.user is None:
-            await self.login(num_of_dialogs, print_chat=True)
-
-        cfg = self.load_config(self.cfg_cls)
-        self.app.add_handler(
-            MessageHandler(self.on_message, filters.text & filters.chat(cfg.chat_ids)),
-        )
+    async def schedule_messages_with_ai(self, channels, num_messages_range, message_length_range):
         async with self.app:
-            self.log("开始监控...")
-            await idle()
+            for channel in channels:
+                self.log(f"开始处理频道: {channel}")
+                # 获取最新的三条文字消息
+                latest_messages = []
+                async for message in self.app.get_chat_history(channel, limit=10):
+                    if message.text:
+                        latest_messages.append(message.text)
+                
+                # 调用AI生成消息
+                ai_client = get_tongyi_client()
+                if not ai_client:
+                    self.log("未配置OpenAI API Key，无法使用AI服务", level="WARNING")
+                    return
+                
+                # 获取当前频道的消息数范围和消息长度范围
+                channel_num_messages_min, channel_num_messages_max = num_messages_range.get(channel, (1, 1))
+                channel_message_length_min, channel_message_length_max = message_length_range.get(channel, (100, 100))
+                
+                # 随机生成消息数和消息长度
+                num_messages = random.randint(channel_num_messages_min, channel_num_messages_max)
+                message_length = random.randint(channel_message_length_min, channel_message_length_max)
+                
+                for i in range(num_messages):
+                    # 生成消息
+                    prompt = f"根据以下内容生成一条长度大约为{message_length}字的回复：\n\n" + "\n".join(latest_messages)
+                    generated_message = await get_reply(prompt, "", client=ai_client)
+                    
+                    # 检查当前时间是否在凌晨2点到早上8点之间
+                    now = get_now()
+                    if 2 <= now.hour < 8:
+                        self.log("当前时间在凌晨2点到早上8点之间，不发送消息", level="WARNING")
+                        continue
+                    
+                    # 完全随机的间隔时间，范围在0.2到1.5小时之间
+                    interval = random.uniform(0.2, 1.5) * 3600  # 0.2到1.5小时
+                    
+                    # 发送消息
+                    self.log(f"发送消息到频道 {channel}: {generated_message}")
+                    await self.send_message(channel, generated_message)
+                    
+                    # 根据动态间隔时间等待
+                    if num_messages > 1:
+                        await asyncio.sleep(interval)  # 动态间隔时间
